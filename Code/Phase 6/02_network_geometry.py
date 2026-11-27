@@ -1,0 +1,61 @@
+"""
+describes each network's shape
+finds mean distance to the nearest other sensor, how varied it is (low: even spacing, high: very clustered), 
+and mean distance to the coast, for greedy, k-means and melbourne's real stations
+"""
+import importlib.util
+import sys
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+from shapely.geometry import Point
+
+ROOT = Path(__file__).resolve().parents[3]
+P4 = ROOT / "Workflow" / "Phase 4" / "Python files"
+sys.path.insert(0, str(P4))
+_spec = importlib.util.spec_from_file_location("cfg4", P4 / "config.py")
+cfg = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(cfg)
+
+NVALS = {"singapore": [8, 22, 40], "melbourne": [8, 22, 32, 40, 88]}
+LAND = {"singapore": ("boundaries/singapore/MasterPlan2025PlanningAreaBoundaryNoSea.geojson", "EPSG:3414"),
+        "melbourne": ("boundaries/melbourne/lga_polygon/lga_polygon.shp", "EPSG:7855")}
+
+
+def coastline(city):
+    path, crs = LAND[city]
+    land = gpd.read_file(cfg.phase3.RAW_DIR / path).to_crs(crs)
+    return land.geometry.make_valid().union_all().boundary
+
+
+def nn_stats(xy):    # for each network, finds average distance to nearest other sensor, and how varied this distance is
+    d = np.hypot(xy[:, None, 0] - xy[None, :, 0], xy[:, None, 1] - xy[None, :, 1])
+    np.fill_diagonal(d, np.inf)
+    nn = d.min(axis=1) / 1000
+    return nn.mean(), nn.std() / nn.mean()
+
+
+def run(city):
+    cand = pd.read_csv(cfg.P3_DIR / city / f"{city}_candidates.csv").sort_values("id").reset_index(drop=True)
+    nets = pd.read_csv(cfg.processed_dir(city) / f"{city}_networks_trainall.csv")
+    coast = coastline(city)
+    coastkm = np.array([coast.distance(Point(x, y)) / 1000 for x, y in zip(cand["x"], cand["y"])])
+    rows = [(city, "all candidate cells", len(cand), np.nan, np.nan, coastkm.mean())]
+    label = f"f{cfg.MAIN_NOISE:g}"
+    for strategy, noise in (("greedy", label), ("kmeans", "any"), ("existing", "any")):
+        sub = nets[(nets["strategy"] == strategy) & (nets["noise"] == noise)]
+        for n in sorted(set(sub["N"]) & set(NVALS[city] + ([8] if strategy == "existing" else []))):
+            idx = sub[sub["N"] == n].sort_values("rank")["cell_index"].to_numpy()
+            meannn, cvnn = nn_stats(cand[["x", "y"]].to_numpy()[idx])
+            rows.append((city, strategy, n, meannn, cvnn, coastkm[idx].mean()))
+    return pd.DataFrame(rows, columns=["city", "network", "N", "nn_mean_km", "nn_cv", "coast_mean_km"])
+
+
+if __name__ == "__main__":
+    df = pd.concat([run(c) for c in cfg.ALL_CITIES], ignore_index=True)
+    out = ROOT / "data" / "processed" / "phase6"
+    out.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out / "phase6_network_geometry.csv", index=False)
+    print(df.round(2).to_string(index=False))
